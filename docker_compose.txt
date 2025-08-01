@@ -1,0 +1,217 @@
+version: '3.8'
+
+services:
+  # Ana uygulama servisi
+  seal-automation:
+    build: .
+    container_name: seal-video-automation
+    restart: unless-stopped
+    ports:
+      - "8000:8000"  # Web dashboard
+      - "7860:7860"  # Gradio interface
+    volumes:
+      - ./data:/app/data
+      - ./output:/app/output
+      - ./logs:/app/logs
+      - ./templates:/app/templates
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - PYTHONPATH=/app
+    env_file:
+      - .env
+    depends_on:
+      - ollama
+      - redis
+      - chroma-db
+    networks:
+      - seal-network
+    
+  # Ollama LLM servisi
+  ollama:
+    image: ollama/ollama:latest
+    container_name: seal-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_HOST=0.0.0.0
+    networks:
+      - seal-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
+  # Redis (queue management için)
+  redis:
+    image: redis:7-alpine
+    container_name: seal-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - seal-network
+    command: redis-server --appendonly yes
+    
+  # ChromaDB (vector database)
+  chroma-db:
+    image: chromadb/chroma:latest
+    container_name: seal-chroma
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      - CHROMA_SERVER_HOST=0.0.0.0
+      - CHROMA_SERVER_HTTP_PORT=8000
+    networks:
+      - seal-network
+      
+  # Celery worker (background tasks)
+  celery-worker:
+    build: .
+    container_name: seal-celery-worker
+    restart: unless-stopped
+    command: celery -A core.celery_app worker --loglevel=info --concurrency=2
+    volumes:
+      - ./data:/app/data
+      - ./output:/app/output
+      - ./logs:/app/logs
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - REDIS_URL=redis://redis:6379/0
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - ollama
+    networks:
+      - seal-network
+      
+  # Celery beat (scheduler)
+  celery-beat:
+    build: .
+    container_name: seal-celery-beat
+    restart: unless-stopped
+    command: celery -A core.celery_app beat --loglevel=info
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    networks:
+      - seal-network
+      
+  # Nginx (reverse proxy)
+  nginx:
+    image: nginx:alpine
+    container_name: seal-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - seal-automation
+    networks:
+      - seal-network
+      
+  # Grafana (monitoring)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: seal-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+    networks:
+      - seal-network
+      
+  # Prometheus (metrics)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: seal-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    networks:
+      - seal-network
+
+volumes:
+  ollama_data:
+    driver: local
+  redis_data:
+    driver: local
+  chroma_data:
+    driver: local
+  grafana_data:
+    driver: local
+  prometheus_data:
+    driver: local
+
+networks:
+  seal-network:
+    driver: bridge
+
+# Alternatif GPU destekli compose için
+---
+# docker-compose.gpu.yml
+version: '3.8'
+
+services:
+  seal-automation-gpu:
+    extends:
+      file: docker-compose.yml
+      service: seal-automation
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - CUDA_VISIBLE_DEVICES=all
+      - NVIDIA_VISIBLE_DEVICES=all
+      
+  ollama-gpu:
+    extends:
+      file: docker-compose.yml
+      service: ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

@@ -1,0 +1,152 @@
+# SEAL Video Automation - Multi-stage Docker Build
+FROM python:3.11-slim as base
+
+# Sistem paketlerini güncelle ve gerekli paketleri yükle
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    wget \
+    curl \
+    git \
+    build-essential \
+    pkg-config \
+    libcairo2-dev \
+    libgirepository1.0-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python bağımlılıkları için stage
+FROM base as python-deps
+
+# Poetry kurulumu (alternatif paket yöneticisi)
+RUN pip install --no-cache-dir poetry
+
+# Çalışma dizini
+WORKDIR /app
+
+# Requirements dosyasını kopyala ve bağımlılıkları yükle
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Spacy model indir
+RUN python -m spacy download en_core_web_sm
+
+# Ana uygulama stage
+FROM python-deps as app
+
+# Uygulama kullanıcısı oluştur
+RUN useradd --create-home --shell /bin/bash app
+USER app
+WORKDIR /home/app
+
+# Uygulama dosyalarını kopyala
+COPY --chown=app:app . .
+
+# Gerekli klasörleri oluştur
+RUN mkdir -p data/knowledge_base data/vector_db data/trends \
+    output/videos output/audio output/scripts \
+    logs templates/video_backgrounds templates/fonts
+
+# Python path ayarla
+ENV PYTHONPATH=/home/app
+ENV PATH="/home/app/.local/bin:$PATH"
+
+# Port exposu
+EXPOSE 8000 7860
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Varsayılan komut
+CMD ["python", "core/main.py", "--auto-mode"]
+
+# GPU destekli versiyon için
+FROM app as app-gpu
+
+USER root
+
+# CUDA runtime kurulumu
+RUN apt-get update && apt-get install -y \
+    nvidia-container-runtime \
+    && rm -rf /var/lib/apt/lists/*
+
+# PyTorch GPU versiyonu
+RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+USER app
+
+# GPU environment variables
+ENV CUDA_VISIBLE_DEVICES=all
+ENV NVIDIA_VISIBLE_DEVICES=all
+
+# Development stage
+FROM app as dev
+
+USER root
+
+# Development araçlarını yükle
+RUN pip install --no-cache-dir \
+    jupyter \
+    ipython \
+    pytest \
+    pytest-asyncio \
+    black \
+    flake8 \
+    mypy \
+    pre-commit
+
+# VS Code server (opsiyonel)
+RUN curl -fsSL https://code-server.dev/install.sh | sh
+
+USER app
+
+# Jupyter çalıştırma komutu
+CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root"]
+
+# Production optimized stage
+FROM python:3.11-slim as production
+
+# Minimal sistem paketleri
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Non-root user
+RUN useradd --create-home --shell /bin/bash --uid 1000 app
+
+# Python bağımlılıkları (production only)
+COPY requirements.txt /tmp/
+RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt \
+    && pip cache purge
+
+# Uygulama dosyaları
+WORKDIR /home/app
+COPY --chown=app:app --from=app /home/app .
+
+# Kullanıcıya geç
+USER app
+
+# Production ortam değişkenleri
+ENV PYTHONPATH=/home/app
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Security headers
+ENV PYTHONHASHSEED=random
+
+# Monitoring port
+EXPOSE 8000
+
+# Production startup
+CMD ["python", "-m", "gunicorn", "core.app:app", "--bind", "0.0.0.0:8000", "--workers", "2", "--worker-class", "uvicorn.workers.UvicornWorker"]
+
+# ========================================
+# Build komutları:
+# ========================================
+# Development: docker build --target dev -t seal-automation:dev .
+# Production: docker build --target production -t seal-automation:prod .
+# GPU: docker build --target app-gpu -t seal-automation:gpu .
+# Base: docker build --target app -t seal-automation:latest .
+# ========================================
