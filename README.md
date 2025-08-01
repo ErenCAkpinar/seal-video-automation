@@ -1,2 +1,2 @@
 # seal-video-automation
-Seal Video Automation
+The cheapest way to make a Seal Video Automation
